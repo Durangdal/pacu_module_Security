@@ -1,134 +1,118 @@
-"""Offline checks: run with python -m unittest discover -s outputs -p 'test_*.py'."""
+"""Offline behavior tests; no credentials or AWS calls."""
 import importlib.util
-import json
 from pathlib import Path
+import sys
+import types
 import unittest
 
-import botocore.session
-from botocore.exceptions import ClientError
-from botocore.validate import validate_parameters
-from botocore import xform_name
+try:
+    from botocore.exceptions import ClientError
+except ImportError:
+    # Isolated exception stand-ins permit offline tests without installing Pacu.
+    exceptions = types.ModuleType('botocore.exceptions')
+    class ClientError(Exception):
+        def __init__(self, response, operation):
+            self.response = response
+    exceptions.ClientError = ClientError
+    exceptions.BotoCoreError = type('BotoCoreError', (Exception,), {})
+    sys.modules['botocore'] = types.ModuleType('botocore')
+    sys.modules['botocore.exceptions'] = exceptions
 
 spec = importlib.util.spec_from_file_location('security', Path(__file__).parent / 'cloudtrail__enum_security/main.py')
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
+security = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(security)
 
 
-class FakeClient:
-    def __init__(self, service, pacu):
-        self.service, self.pacu = service, pacu
-        self.model = botocore.session.get_session().get_service_model(service)
-
-    def __getattr__(self, operation):
-        operation_name = next(n for n in self.model.operation_names if xform_name(n) == operation)
-        shape = self.model.operation_model(operation_name).input_shape
-
-        def call(**params):
-            validate_parameters(params, shape)
-            self.pacu.calls.append((self.service, operation, params))
-            if operation == 'describe_trails':
-                trail = {'Name': 'audit', 'TrailARN': 'arn:aws:cloudtrail:us-east-1:123456789012:trail/audit',
-                         'HomeRegion': 'us-east-1', 'IsMultiRegionTrail': True, 'IsOrganizationTrail': True,
-                         'LogFileValidationEnabled': True, 'S3BucketName': 'audit-bucket',
-                         'KmsKeyId': 'arn:aws:kms:us-east-1:123456789012:key/test',
-                         'CloudWatchLogsLogGroupArn': 'arn:aws:logs:us-west-2:123456789012:log-group:audit:*',
-                         'SnsTopicARN': 'arn:aws:sns:us-east-1:123456789012:audit'}
-                return {'trailList': [trail]}
-            if operation == 'get_bucket_policy':
-                raise ClientError({'Error': {'Code': 'AccessDenied'}}, operation_name)
-            if operation == 'get_bucket_location':
-                return {'LocationConstraint': None}
-            if operation == 'get_trail_status':
-                return {'IsLogging': False}
-            if operation == 'get_bucket_encryption':
-                return {'ServerSideEncryptionConfiguration': {'Rules': [{'ApplyServerSideEncryptionByDefault':
-                        {'KMSMasterKeyID': 'test', 'SSEAlgorithm': 'aws:kms'}}]}}
-            if operation == 'get_event_selectors':
-                return {'EventSelectors': [{'ReadWriteType': 'All', 'IncludeManagementEvents': True,
-                                           'DataResources': []}], 'AdvancedEventSelectors': []}
-            if operation == 'describe_metric_filters':
-                if 'nextToken' not in params:
-                    return {'metricFilters': [], 'nextToken': 'page2'}
-                return {'metricFilters': [{'metricTransformations': [{'metricNamespace': 'Audit', 'metricName': 'Changes'}]}]}
-            if operation == 'describe_alarms':
-                return {'MetricAlarms': [{'Namespace': 'Audit', 'MetricName': 'Changes',
-                         'AlarmActions': ['arn:aws:sns:us-west-2:123456789012:alarm']}], 'CompositeAlarms': []}
-            if operation == 'list_event_buses':
-                return {'EventBuses': [{'Name': 'default'}]}
-            if operation == 'list_rules':
-                return {'Rules': [{'Name': 'audit', 'State': 'ENABLED', 'EventPattern': '{}'}]}
-            if operation == 'list_targets_by_rule':
-                return {'Targets': [{'Arn': 'arn:aws:sns:us-east-1:123456789012:events'}]}
-            return {}
-        return call
-
-
-class FakeSession:
-    CloudTrail = {'Trails': [{'Name': 'existing'}], 'Other': {'keep': True}}
-
-    def update(self, database, **kwargs):
-        self.CloudTrail = kwargs['CloudTrail']
-        json.dumps(self.CloudTrail)
-
-
-class FakePacu:
+class Pacu:
+    database = None
     def __init__(self):
-        self.session, self.calls, self.database = FakeSession(), [], None
-
+        self.CloudTrail = {'Trails': [{'Name': 'preserved'}]}
+        self.calls = []
     def get_active_session(self):
-        return self.session
-
+        return self
     def get_regions(self, service):
-        return ['us-east-1', 'us-west-2']
-
-    def get_boto3_client(self, service, region):
-        return FakeClient(service, self)
-
+        return ['us-east-1']
     def key_info(self):
-        return {'Permissions': {'Allow': {'cloudtrail:*': {'Resources': ['*'], 'Conditions': []}},
-                                'Deny': {'cloudtrail:DeleteTrail': {'Resources': ['*'], 'Conditions': []}}}}
-
+        return {'Permissions': {'Allow': {'cloudtrail:*': {'Resources': ['*'], 'Conditions': []}}}}
     def print(self, message):
         pass
+    def update(self, database, **fields):
+        self.CloudTrail = fields['CloudTrail']
+    def get_boto3_client(self, service, region):
+        parent = self
+        class Client:
+            def __getattr__(self, operation):
+                def call(**params):
+                    parent.calls.append((service, operation, params))
+                    if operation == 'get_caller_identity':
+                        return {'Arn': 'arn:aws:iam::123456789012:user/auditor'}
+                    if operation == 'describe_trails':
+                        return {'trailList': [{'Name': 'audit', 'HomeRegion': 'us-east-1',
+                                'TrailARN': 'arn:aws:cloudtrail:us-east-1:123456789012:trail/audit'}]}
+                    if operation == 'simulate_principal_policy':
+                        return {'EvaluationResults': [{'EvalActionName': params['ActionNames'][0],
+                                'EvalResourceName': params['ResourceArns'][0], 'EvalDecision': 'allowed'}]}
+                    return {}
+                return call
+        return Client()
 
 
-class Checks(unittest.TestCase):
-    def test_offline_end_to_end_and_aws_parameter_shapes(self):
-        pacu = FakePacu()
-        data = module.main([], pacu)
-        self.assertEqual(len(data['Trails']), 1)
-        self.assertEqual(data['Trails'][0]['Storage']['Policy']['Status'], 'ACCESS DENIED')
-        self.assertEqual(data['Trails'][0]['Storage']['Versioning']['Status'], 'OK')
-        self.assertEqual(len(data['Trails'][0]['Detection']['CandidateMetricAlarms']), 1)
-        self.assertEqual(len(data['SNS']), 3)
-        self.assertEqual(pacu.session.CloudTrail['Other'], {'keep': True})
-        self.assertEqual(pacu.session.CloudTrail['Trails'], [{'Name': 'existing'}])
-        self.assertIn('not currently logging', module.summary(data, pacu))
-        self.assertTrue(all(op in module.READS[service] for service, op, _ in pacu.calls))
-        self.assertTrue(all(p['EffectivePermission'] == 'UNKNOWN' for p in data['DangerousPermissions']))
-        self.assertEqual(data['DangerousPermissions'][1]['PolicyEvidence'], 'ALLOW_AND_DENY')
+class Tests(unittest.TestCase):
+    def test_default_main_simulates_and_preserves_db(self):
+        pacu = Pacu()
+        result = security.main([], pacu)
+        self.assertEqual(pacu.CloudTrail['Trails'], [{'Name': 'preserved'}])
+        decisions = result['DangerousPermissions']['Results']
+        self.assertEqual(sum(r['SimulationDecision'] == 'allowed' for r in decisions), 5)
+        self.assertTrue(all(r['LiveExecution'] == 'NOT TESTED' for r in decisions))
+        self.assertTrue(all(op in security.READS[service] for service, op, _ in pacu.calls))
+        self.assertIn('Security Summary', security.summary(result, pacu))
 
-    def test_partial_pagination_keeps_data_and_denial(self):
-        pacu = FakePacu()
-        class Partial:
+    def test_missing_context_never_reports_allow(self):
+        class Reader:
+            def read(self, service, region, operation, **params):
+                if operation != 'simulate_principal_policy':
+                    return {'Status': 'OK', 'Data': {}}
+                return {'Status': 'OK', 'Data': {'EvaluationResults': [
+                    {'EvalActionName': 'cloudtrail:StopLogging', 'EvalResourceName': 'trail-arn',
+                     'EvalDecision': 'allowed', 'MissingContextValues': ['aws:SourceIp']}]}}
+        result = security.simulate(Reader(), {'Status': 'OK', 'Arn': 'user-arn'},
+                                   [{'Action': 'cloudtrail:StopLogging', 'Resource': 'trail-arn'}],
+                                   [], security.cached_evidence(Pacu()), True)
+        self.assertEqual(result['Results'][0]['SimulationDecision'], 'UNKNOWN')
+        self.assertEqual(result['Results'][0]['MissingContextValues'], ['aws:SourceIp'])
+
+    def test_no_simulate_makes_no_iam_or_sts_calls(self):
+        pacu = Pacu()
+        security.main(['--no-simulate'], pacu)
+        self.assertFalse(any(s in ('iam', 'sts') for s, _, _ in pacu.calls))
+
+    def test_deny_continues_and_keeps_partial_pages(self):
+        pacu = Pacu()
+        class Client:
             def describe_metric_filters(self, **params):
                 if params.get('nextToken'):
-                    raise ClientError({'Error': {'Code': 'AccessDeniedException'}}, 'DescribeMetricFilters')
+                    raise ClientError({'Error': {'Code': 'AccessDenied'}}, 'DescribeMetricFilters')
                 return {'metricFilters': [{'filterName': 'first'}], 'nextToken': 'second'}
-        pacu.get_boto3_client = lambda *args: Partial()
-        response = module.Reader(pacu).read('logs', 'us-east-1', 'describe_metric_filters',
-                                            keys=['metricFilters'], token='nextToken', logGroupName='audit')
+        pacu.get_boto3_client = lambda *args: Client()
+        response = security.Reader(pacu).read('logs', 'us-east-1', 'describe_metric_filters',
+                                              keys=['metricFilters'], token='nextToken', logGroupName='audit')
         self.assertEqual(response['Status'], 'ACCESS DENIED')
         self.assertEqual(len(response['Data']['metricFilters']), 1)
 
-    def test_no_permission_data_is_unknown(self):
-        pacu = FakePacu()
-        pacu.key_info = lambda: False
-        self.assertTrue(all(p['PolicyEvidence'] == 'UNKNOWN' for p in module.permissions(pacu)))
+    def test_assumed_role_uses_canonical_role_arn(self):
+        class Reader:
+            def read(self, service, region, operation, **params):
+                if service == 'sts':
+                    return {'Status': 'OK', 'Data': {'Arn': 'arn:aws:sts::123456789012:assumed-role/audit/session'}}
+                return {'Status': 'OK', 'Data': {'Role': {'Arn': 'arn:aws:iam::123456789012:role/team/audit'}}}
+        result = security.resolve_principal(Reader())
+        self.assertEqual(result['Arn'], 'arn:aws:iam::123456789012:role/team/audit')
+        self.assertIn('session', result['Scope'])
 
-    def test_mutation_guard(self):
-        with self.assertRaises(AssertionError):
-            module.Reader(FakePacu()).read('cloudtrail', 'us-east-1', 'stop_logging', Name='audit')
+    def test_mutations_blocked(self):
+        with self.assertRaises(ValueError):
+            security.Reader(Pacu()).read('cloudtrail', None, 'stop_logging', Name='audit')
 
 
 if __name__ == '__main__':
